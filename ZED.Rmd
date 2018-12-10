@@ -1,0 +1,244 @@
+---
+title: "Projekt ZED"
+author: "Piotr Skoczek"
+date: "2 grudnia 2018"
+output: 
+  html_document: 
+    keep_md: yes
+    number_sections: yes
+    toc: yes
+    toc_float: yes
+---
+
+```{r, echo = FALSE}
+prettyTable <- function(table_df, round_columns=numeric(), round_digits=2) {
+    DT::datatable(table_df, style="bootstrap", filter = "top", rownames = FALSE, extensions = "Buttons", options = list(dom = 'Bfrtip', buttons = c('copy', 'csv', 'excel', 'pdf', 'print'))) %>%
+    formatRound(round_columns, round_digits)
+}
+```
+
+#Wprowadzenie
+
+Niniejszy raport przedstawia analizê danych w jêzyku R. Zestaw danych, pochodz¹cy z Protein Data Bank, dotyczy ligandów. Po wstêpnym przetworzeniu danych pokazano rozk³ad liczby atomów i elektronów, ligandy o najwiêkszej niezgodnoœci liczby atomów i elektronów, czy korelacjê miêdzy niektórymi zmiennymi. Raport zakoñczony jest stworzeniem klasyfikatora, który na podstawie pozosta³ych parametrów próbuje przewidzieæ nazwê ligandu.
+
+#£adowanie bibliotek
+
+```{r ladowanie biblioteki, results = 'hide', message = FALSE}
+library(data.table)
+library(dplyr)
+library(DT)
+library(tidyr)
+library(ggplot2)
+library(plotly)
+library(knitr)
+library(reshape2)
+library(kableExtra)
+library(caret)
+library(party)
+opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+#Zapewnienie powtarzalnoœci
+
+```{r powtarzalnosc}
+set.seed(123)
+```
+
+#Wczytywanie danych z pliku
+
+```{r wczytywanie}
+data <- fread("all_summary.csv", nrows = 300000)
+```
+
+
+#Usuwanie niektórych wierszy
+
+```{r usuwanie z nazwa}
+to_remove <- c("UNK", "UNX", "UNL", "DUM", "N", "BLOB", "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE", "LEU", "LYS", "MET", "MSE", "PHE", "PRO", "SEC", "SER", "THR", "TRP", "TYR", "VAL", "DA", "DG", "DT", "DC", "DU", "A", "G", "T", "C", "U", "HOH", "H20", "WAT")
+data_cleared <- data %>% select(-(blob_coverage:pdb_code), -(res_id:local_res_atom_count), -(local_res_atom_non_h_occupancy_sum), -(local_res_atom_non_h_electron_occupancy_sum:local_res_atom_S_count), -(dict_atom_C_count:skeleton_periphery), -(local_max_over_std), -(local_cut_by_mainchain_volume:local_near_cut_count_N), -(fo_col:resolution_max_limit), -(part_step_FoFc_std_min:part_step_FoFc_std_step)) %>%
+  filter(res_name != to_remove)
+```
+
+Powy¿szy kod usuwa wiersze z podanymi wartoœciami res_name oraz kolumny, które s¹ nieopisane, niewykorzystywane do klasyfikacji lub zawieraj¹ce du¿o brakuj¹cych wartoœci.
+
+#Usuwanie wierszy z brakuj¹cymi wartoœciami
+
+```{r usuwanie na}
+data_final <- drop_na(data_cleared)
+```
+
+#Podsumowanie
+
+Rozmiar zbioru to: `r dim(data_final)`. Poni¿ej przedstawiona jest tabela zawieraj¹ca podstawowe statystyki.
+
+```{r podsumowanie}
+dim(data_final)
+knitr::kable(summary(data_final, digits = 2)) %>% 
+  kable_styling(full_width = F) %>% 
+  scroll_box(width = "100%")
+```
+
+#Ograniczenie zakresu
+
+Poni¿szy kod ogranicza liczbê wierszy, pozostawiaj¹c tylko 50 najczêœciej wystêpuj¹cych wartoœci atrybutu res_name.
+
+```{r 50 klas}
+top_50 <- data_final %>% group_by(res_name) %>%
+  summarize(ilosc=n()) %>% arrange(desc(ilosc)) %>% head(50) 
+data_final_50 <- data_final %>% filter(res_name %in% top_50[['res_name']])
+```
+
+#Korelacja miêdzy zmiennymi
+
+Poni¿ej przedstawiono korelacjê pomiêdzy niektórymi zmiennymi.
+
+```{r korelacja}
+cor_grouped <- data_final_50 %>% select(local_res_atom_non_h_count:local_skewness, -local_min)
+
+cor_data <- melt(cor(cor_grouped))
+ggplot(cor_data, aes(x = Var1, y = Var2, fill = value)) + geom_tile() + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+#Liczebnoœæ 50 najpopularniejszych klas
+
+```{r ilosc klas}
+knitr::kable(top_50, align = 'l') %>%
+  kable_styling("striped", full_width = FALSE) %>% 
+  column_spec(1, width = "2.5cm")
+```
+
+#Wykres rozk³adu liczby atomów
+
+```{r wykres atomow}
+plot_atom <- ggplot(data_final_50, aes(local_res_atom_non_h_count, fill = res_name)) + geom_histogram()
+ggplotly(plot_atom)
+```
+
+#Wykres rozk³adu liczby elektronów
+
+```{r wykres elektronow}
+plot_elect <- ggplot(data_final_50, aes(local_res_atom_non_h_electron_sum, fill = res_name)) + geom_histogram()
+ggplotly(plot_elect)
+```
+
+#Niezgodnoœæ liczby atomów
+
+Tabela w tej sekcji przedstawia 10 klas z najwiêksz¹ niezgodnoœci¹ liczby atomów.
+
+```{r niezgodnosc atomow}
+niezg_atom <- data_final_50 %>%
+  select(res_name, local_res_atom_non_h_count, dict_atom_non_h_count) %>%
+  mutate(Roznica_atomow = dict_atom_non_h_count - local_res_atom_non_h_count) %>%
+  group_by(res_name) %>%
+  summarize(Niezgodnosc_atomow = sum(Roznica_atomow)) %>%
+  arrange(desc(Niezgodnosc_atomow)) %>% head(10)
+
+knitr::kable(niezg_atom) %>%
+  kable_styling("striped", full_width = FALSE) %>% 
+  column_spec(1, width = "2.5cm")
+```
+
+#Niezgodnoœæ liczby elektronów
+
+Tabela w tej sekcji przedstawia 10 klas z najwiêksz¹ niezgodnoœci¹ liczby elektronów.
+
+```{r niezgodnosc elektronow}
+niezg_elect <- data_final_50 %>%
+  select(res_name, local_res_atom_non_h_electron_sum, dict_atom_non_h_electron_sum) %>%
+  mutate(Roznica_elektronow = dict_atom_non_h_electron_sum - local_res_atom_non_h_electron_sum) %>%
+  group_by(res_name) %>%
+  summarize(Niezgodnosc_elektronow = sum(Roznica_elektronow)) %>%
+  arrange(desc(Niezgodnosc_elektronow)) %>% head(10)
+
+knitr::kable(niezg_elect) %>%
+  kable_styling("striped", full_width = FALSE) %>% 
+  column_spec(1, width = "2.5cm")
+```
+
+#Wykresy part_01
+
+Poni¿sze wykresy prezentuj¹ rozk³ad wartoœci kolumn 'part_01...' z podzia³em na klasy res_name.
+
+```{r part_01, results = FALSE}
+data_part <- data_final_50 %>% select(res_name,part_01_shape_segments_count:part_01_density_Z_4_0)
+data_part_01 <- data_part %>% select(-res_name)
+names_list <- as.list(colnames(data_part_01))
+
+plot.fn.with.aes <- function(y.axis, x.axis) {
+  
+      ggplot(data_part, 
+             aes_string(x = x.axis, 
+                        y = y.axis,
+                        color = x.axis)) + 
+            geom_point() + theme(axis.text.x = element_blank()) +
+            stat_summary(fun.y=mean, colour="black", geom="point", 
+               shape=4, size=2, show.legend = FALSE) +
+            stat_summary(fun.y=mean, colour="black", geom="text", show.legend = FALSE,
+               hjust=-0.2, size=2.6, angle = 90, aes( label=round(..y.., digits=1)))
+}
+
+lapply(names_list, plot.fn.with.aes, x.axis = "res_name")
+```
+
+#Regresja
+
+Przeprowadzenie regresji oraz wyliczenie miar R^2 i RMSE dla przewidywania liczby atomów:
+
+```{r regresja atom}
+idx <- createDataPartition(y = data_final_50$local_res_atom_non_h_count, p = .6, list = FALSE)
+training <- data_final_50[idx, ]
+testing <- data_final_50[-idx, ]
+ctrl <- trainControl(method = "repeatedcv", number = 2,repeats = 5)
+
+lm <- train(local_res_atom_non_h_count ~ .,
+                data = training,
+                method = "lm",
+                metric = "RMSE",
+                trControl = ctrl)
+lmp<-predict(lm, newdata=testing)
+postResample(lmp,testing$local_res_atom_non_h_count)
+```
+
+Przeprowadzenie regresji oraz wyliczenie miar R^2 i RMSE dla przewidywania liczby elektronów:
+
+```{r regresja elektron}
+idx <- createDataPartition(y = data_final_50$local_res_atom_non_h_electron_sum, p = .6, list = FALSE)
+training <- data_final_50[idx, ]
+testing <- data_final_50[-idx, ]
+ctrl <- trainControl(method = "repeatedcv", number = 2,repeats = 5)
+
+lm <- train(local_res_atom_non_h_electron_sum ~ .,
+                data = training,
+                method = "lm",
+                metric = "RMSE",
+                trControl = ctrl)
+lmp<-predict(lm, newdata=testing)
+postResample(lmp,testing$local_res_atom_non_h_electron_sum)
+```
+
+#Klasyfikator
+
+Tworzenie klasyfikatora przewiduj¹cego wartoœæ atrybutu res_name:
+
+```{r klasyfikator}
+idx <- createDataPartition(data_final_50$res_name, p = .6, list = FALSE)
+
+training <- data_final_50[idx,]
+
+testing <- data_final_50[-idx,]
+
+ctrl <- trainControl(method="repeatedcv", number=2, repeats = 5)
+
+classifier <- train(as.factor(res_name) ~ .,
+             data = training,
+             method = "rf",
+             trControl = ctrl,
+             ntree = 4)
+
+predictions <- predict(classifier, newdata = testing)
+
+results <- confusionMatrix(data = predictions, 
+                factor(testing[,1]))
+
+knitr::kable(results$overall)
+```
